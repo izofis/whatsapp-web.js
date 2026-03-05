@@ -40,6 +40,7 @@ const {exposeFunctionIfAbsent} = require('./util/Puppeteer');
  * @param {string} options.deviceName - Sets the device name of a current linked device., i.e.: 'TEST'.
  * @param {string} options.browserName - Sets the browser name of a current linked device, i.e.: 'Firefox'.
  * @param {object} options.proxyAuthentication - Proxy Authentication object.
+ * @param {object} options.logger - Custom logger object (optional). If not provided, logs to logs/whatsapp-client-YYYY-MM-DD.json
  * @param {object} options.ciphertextRetry - Configuration for ciphertext message retry/recovery mechanism
  * @param {boolean} options.ciphertextRetry.enabled - Whether the retry mechanism is enabled (default: true)
  * @param {number} options.ciphertextRetry.initialTimeoutMs - Time in ms to wait for natural decryption before attempting retry (default: 10000)
@@ -82,6 +83,13 @@ class Client extends EventEmitter {
 
         this.authStrategy.setup(this);
 
+        // ✅ Logger desteği: Kullanıcı kendi logger'ını inject edebilir, yoksa default file logger
+        // Örnek: new Client({ logger: yourCustomLogger })
+        // Default: require('./util/Logger') - logs/whatsapp-client-YYYY-MM-DD.json (günlük rotation)
+        // NOT: Logger geçici bir çözümdür, update sonrası kolayca kaldırılabilir/eklenebilir
+        //      Kaldırmak için: 1) src/util/Logger.js dosyasını silin, 2) Bu satırı düzeltin
+        this.logger = this.options.logger || require('./util/Logger');
+
         /**
          * @type {puppeteer.Browser}
          */
@@ -95,6 +103,7 @@ class Client extends EventEmitter {
         this.lastLoggedOut = false;
         this._authEventListenersInjected = false; // Prevent duplicate event listeners
         this._readyEmitted = false; // Prevent duplicate READY events
+        this._puppeteerListenersAttached = false; // Prevent duplicate Puppeteer console/pageerror listeners
 
         Util.setFfmpegPath(this.options.ffmpegPath);
     }
@@ -520,6 +529,53 @@ class Client extends EventEmitter {
      * @property {boolean} reinject is this a reinject?
      */
     async attachEventListeners() {
+        // ═══════════════════════════════════════════════════════════
+        // ✅ PUPPETEER CONSOLE EVENT'LERİNİ LOGGER'A YÖNLENDİR
+        // ═══════════════════════════════════════════════════════════
+        // Guard: Duplicate event listener registration'ı engelle
+        if (!this._puppeteerListenersAttached) {
+            this.pupPage.on('console', msg => {
+                const text = msg.text();
+                const type = msg.type();
+                
+                // E2E notification debug loglarını özel işaretle
+                if (text.includes('E2E NOTIFICATION DEBUG') || 
+                    text.includes('E2E notification') ||
+                    text.includes('===========================')) {
+                    this.logger.debug(`[🔒 E2E Browser] ${text}`);
+                } 
+                // Hata logları
+                else if (type === 'error') {
+                    this.logger.error(`[Browser Error] ${text}`);
+                } 
+                // Uyarı logları
+                else if (type === 'warning') {
+                    this.logger.warn(`[Browser Warn] ${text}`);
+                } 
+                // E2E notification işaretleri (✅ ve ⛔)
+                else if (text.includes('✅') || text.includes('⛔')) {
+                    this.logger.info(`[Browser] ${text}`);
+                }
+                // Diğer debug logları (isteğe bağlı - çok fazla log üretebilir)
+                // else {
+                //     this.logger.debug(`[Browser] ${text}`);
+                // }
+            });
+
+            // ═══════════════════════════════════════════════════════════
+            // ✅ BROWSER PAGE ERROR'LARINI YAKALA
+            // ═══════════════════════════════════════════════════════════
+            this.pupPage.on('pageerror', error => {
+                this.logger.error(`[Page Error] ${error.message}`);
+                if (error.stack) {
+                    this.logger.debug(`[Page Error Stack] ${error.stack}`);
+                }
+            });
+
+            // Mark as attached
+            this._puppeteerListenersAttached = true;
+        }
+
         await exposeFunctionIfAbsent(this.pupPage, 'onAddMessageEvent', msg => {
             if (msg.type === 'gp2') {
                 const notification = new GroupNotification(this, msg);
