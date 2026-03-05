@@ -83,13 +83,6 @@ class Client extends EventEmitter {
 
         this.authStrategy.setup(this);
 
-        // ✅ Logger desteği: Kullanıcı kendi logger'ını inject edebilir, yoksa default file logger
-        // Örnek: new Client({ logger: yourCustomLogger })
-        // Default: require('./util/Logger') - logs/whatsapp-client-YYYY-MM-DD.json (günlük rotation)
-        // NOT: Logger geçici bir çözümdür, update sonrası kolayca kaldırılabilir/eklenebilir
-        //      Kaldırmak için: 1) src/util/Logger.js dosyasını silin, 2) Bu satırı düzeltin
-        this.logger = this.options.logger || require('./util/Logger');
-
         /**
          * @type {puppeteer.Browser}
          */
@@ -103,7 +96,6 @@ class Client extends EventEmitter {
         this.lastLoggedOut = false;
         this._authEventListenersInjected = false; // Prevent duplicate event listeners
         this._readyEmitted = false; // Prevent duplicate READY events
-        this._puppeteerListenersAttached = false; // Prevent duplicate Puppeteer console/pageerror listeners
 
         Util.setFfmpegPath(this.options.ffmpegPath);
     }
@@ -529,53 +521,6 @@ class Client extends EventEmitter {
      * @property {boolean} reinject is this a reinject?
      */
     async attachEventListeners() {
-        // ═══════════════════════════════════════════════════════════
-        // ✅ PUPPETEER CONSOLE EVENT'LERİNİ LOGGER'A YÖNLENDİR
-        // ═══════════════════════════════════════════════════════════
-        // Guard: Duplicate event listener registration'ı engelle
-        if (!this._puppeteerListenersAttached) {
-            this.pupPage.on('console', msg => {
-                const text = msg.text();
-                const type = msg.type();
-                
-                // E2E notification debug loglarını özel işaretle
-                if (text.includes('E2E NOTIFICATION DEBUG') || 
-                    text.includes('E2E notification') ||
-                    text.includes('===========================')) {
-                    this.logger.debug(`[🔒 E2E Browser] ${text}`);
-                } 
-                // Hata logları
-                else if (type === 'error') {
-                    this.logger.error(`[Browser Error] ${text}`);
-                } 
-                // Uyarı logları
-                else if (type === 'warning') {
-                    this.logger.warn(`[Browser Warn] ${text}`);
-                } 
-                // E2E notification işaretleri (✅ ve ⛔)
-                else if (text.includes('✅') || text.includes('⛔')) {
-                    this.logger.info(`[Browser] ${text}`);
-                }
-                // Diğer debug logları (isteğe bağlı - çok fazla log üretebilir)
-                // else {
-                //     this.logger.debug(`[Browser] ${text}`);
-                // }
-            });
-
-            // ═══════════════════════════════════════════════════════════
-            // ✅ BROWSER PAGE ERROR'LARINI YAKALA
-            // ═══════════════════════════════════════════════════════════
-            this.pupPage.on('pageerror', error => {
-                this.logger.error(`[Page Error] ${error.message}`);
-                if (error.stack) {
-                    this.logger.debug(`[Page Error Stack] ${error.stack}`);
-                }
-            });
-
-            // Mark as attached
-            this._puppeteerListenersAttached = true;
-        }
-
         await exposeFunctionIfAbsent(this.pupPage, 'onAddMessageEvent', msg => {
             if (msg.type === 'gp2') {
                 const notification = new GroupNotification(this, msg);
@@ -940,34 +885,6 @@ class Client extends EventEmitter {
                 window.Store.Msg.on('remove', (msg) => { if (msg.isNewMsg) window.onRemoveMessageEvent(window.WWebJS.getMessageModel(msg)); });
                 window.Store.Msg.on('change:body change:caption', (msg, newBody, prevBody) => { window.onEditMessageEvent(window.WWebJS.getMessageModel(msg), newBody, prevBody); });
                 window.Store.Msg.on('add', (msg) => {
-                    // ✅ E2E notification kontrolü ÖNCE (isNewMsg'den bağımsız)
-                    // WhatsApp'ın yeni şifreleme mekanizması bazı gerçek kullanıcı mesajlarını
-                    // e2e_notification olarak gönderiyor. Body varsa gerçek mesajdır!
-                    const isE2ENotification = msg.type === 'e2e_notification';
-                    const isProtocolMessage = msg.type === 'protocol';
-                    
-                    if (isE2ENotification) {
-                        // Body veya notificationParameters varsa gerçek kullanıcı mesajı
-                        const hasBody = msg.body && msg.body.trim() !== '';
-                        const hasNotificationParams = msg.notificationParameters && 
-                                                       msg.notificationParameters.length > 0;
-                        
-                        if (hasBody || hasNotificationParams) {
-                            // ✅ Gerçek kullanıcı mesajı - event'e gönder
-                            window.onAddMessageEvent(window.WWebJS.getMessageModel(msg));
-                            return;
-                        } else {
-                            // ⛔ Protokol mesajı (güvenlik kodu değişimi vb.) - skip et
-                            return;
-                        }
-                    }
-                    
-                    if (isProtocolMessage) {
-                        // Protokol mesajlarını skip et
-                        return;
-                    }
-                    
-                    // ✅ Diğer mesajlar için mevcut mantık
                     if (msg.isNewMsg) {
                         if(msg.type === 'ciphertext') {
                             const msgKey = msg.id._serialized;
