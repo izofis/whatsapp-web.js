@@ -36,6 +36,7 @@
     "puppeteer": "^24.31.0"
   },
   "devDependencies": {
+    "@pedroslopez/moduleraid": "^5.0.2",
     "@types/node-fetch": "^2.5.12",
     "chai": "^4.3.4",
     "chai-as-promised": "^7.1.1",
