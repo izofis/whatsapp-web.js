@@ -884,6 +884,34 @@ class Client extends EventEmitter {
                 window.Store.Msg.on('remove', (msg) => { if (msg.isNewMsg) window.onRemoveMessageEvent(window.WWebJS.getMessageModel(msg)); });
                 window.Store.Msg.on('change:body change:caption', (msg, newBody, prevBody) => { window.onEditMessageEvent(window.WWebJS.getMessageModel(msg), newBody, prevBody); });
                 window.Store.Msg.on('add', (msg) => {
+                    // ✅ E2E notification kontrolü ÖNCE (isNewMsg'den bağımsız)
+                    // WhatsApp'ın yeni şifreleme mekanizması bazı gerçek kullanıcı mesajlarını
+                    // e2e_notification olarak gönderiyor. Body varsa gerçek mesajdır!
+                    const isE2ENotification = msg.type === 'e2e_notification';
+                    const isProtocolMessage = msg.type === 'protocol';
+                    
+                    if (isE2ENotification) {
+                        // Body veya notificationParameters varsa gerçek kullanıcı mesajı
+                        const hasBody = msg.body && msg.body.trim() !== '';
+                        const hasNotificationParams = msg.notificationParameters && 
+                                                       msg.notificationParameters.length > 0;
+                        
+                        if (hasBody || hasNotificationParams) {
+                            // ✅ Gerçek kullanıcı mesajı - event'e gönder
+                            window.onAddMessageEvent(window.WWebJS.getMessageModel(msg));
+                            return;
+                        } else {
+                            // ⛔ Protokol mesajı (güvenlik kodu değişimi vb.) - skip et
+                            return;
+                        }
+                    }
+                    
+                    if (isProtocolMessage) {
+                        // Protokol mesajlarını skip et
+                        return;
+                    }
+                    
+                    // ✅ Diğer mesajlar için mevcut mantık
                     if (msg.isNewMsg) {
                         if(msg.type === 'ciphertext') {
                             const msgKey = msg.id._serialized;
