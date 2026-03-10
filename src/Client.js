@@ -968,6 +968,7 @@ class Client extends EventEmitter {
 
                                         const pending = _pendingCiphertexts.get(msgKey);
                                         if (pending) {
+                                            if (pending.pdoTimer) clearTimeout(pending.pdoTimer);
                                             pending.pdoTimer = pdoTimer;
                                         }
                                     };
