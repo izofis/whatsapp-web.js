@@ -45,6 +45,7 @@ const {exposeFunctionIfAbsent} = require('./util/Puppeteer');
  * @param {boolean} options.ciphertextRetry.enabled - Whether the retry mechanism is enabled (default: true)
  * @param {number} options.ciphertextRetry.initialTimeoutMs - Time in ms to wait for natural decryption before attempting retry (default: 10000)
  * @param {number} options.ciphertextRetry.retryTimeoutMs - Time in ms to wait after each retry step before proceeding (default: 15000)
+ * @param {number} options.ciphertextRetry.maxPdoRetries - Maximum number of PDO (Peer Data Operation) recovery requests to send before giving up (default: 5)
  * 
  * @fires Client#qr
  * @fires Client#authenticated
@@ -907,6 +908,7 @@ class Client extends EventEmitter {
                             if (ciphertextRetryOptions && ciphertextRetryOptions.enabled) {
                                 const initialTimeoutMs = ciphertextRetryOptions.initialTimeoutMs || 10000;
                                 const retryTimeoutMs = ciphertextRetryOptions.retryTimeoutMs || 15000;
+                                const maxPdoRetries = ciphertextRetryOptions.maxPdoRetries || 5;
 
                                 const initialTimer = setTimeout(async () => {
                                     if (msg.type !== 'ciphertext') {
@@ -927,11 +929,14 @@ class Client extends EventEmitter {
                                         }
                                     } catch (_) { /* empty */ }
 
-                                    const retryTimer = setTimeout(async () => {
+                                    let pdoAttempt = 0;
+                                    const attemptPdo = async () => {
                                         if (msg.type !== 'ciphertext') {
                                             _pendingCiphertexts.delete(msgKey);
                                             return;
                                         }
+
+                                        pdoAttempt++;
 
                                         try {
                                             // Send PDO type 4 request to recover the message
@@ -950,18 +955,24 @@ class Client extends EventEmitter {
                                                 return;
                                             }
 
-                                            msg.off('change:type', onDecrypted);
-                                            _pendingCiphertexts.delete(msgKey);
-                                            window.onCiphertextRetryFailedEvent(
-                                                window.WWebJS.getMessageModel(msg)
-                                            );
+                                            if (pdoAttempt < maxPdoRetries) {
+                                                attemptPdo();
+                                            } else {
+                                                msg.off('change:type', onDecrypted);
+                                                _pendingCiphertexts.delete(msgKey);
+                                                window.onCiphertextRetryFailedEvent(
+                                                    window.WWebJS.getMessageModel(msg)
+                                                );
+                                            }
                                         }, retryTimeoutMs);
 
                                         const pending = _pendingCiphertexts.get(msgKey);
                                         if (pending) {
                                             pending.pdoTimer = pdoTimer;
                                         }
-                                    }, retryTimeoutMs);
+                                    };
+
+                                    const retryTimer = setTimeout(attemptPdo, retryTimeoutMs);
 
                                     const pending = _pendingCiphertexts.get(msgKey);
                                     if (pending) {

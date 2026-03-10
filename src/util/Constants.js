@@ -28,6 +28,7 @@ exports.DefaultOptions = {
         enabled: true,
         initialTimeoutMs: 10000,
         retryTimeoutMs: 15000,
+        maxPdoRetries: 5,
     },
 };
 
