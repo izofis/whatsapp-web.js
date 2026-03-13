@@ -41,11 +41,6 @@ const {exposeFunctionIfAbsent} = require('./util/Puppeteer');
  * @param {string} options.browserName - Sets the browser name of a current linked device, i.e.: 'Firefox'.
  * @param {object} options.proxyAuthentication - Proxy Authentication object.
  * @param {object} options.logger - Custom logger object (optional). If not provided, logs to logs/whatsapp-client-YYYY-MM-DD.json
- * @param {object} options.ciphertextRetry - Configuration for ciphertext message retry/recovery mechanism
- * @param {boolean} options.ciphertextRetry.enabled - Whether the retry mechanism is enabled (default: true)
- * @param {number} options.ciphertextRetry.initialTimeoutMs - Time in ms to wait for natural decryption before attempting retry (default: 10000)
- * @param {number} options.ciphertextRetry.retryTimeoutMs - Time in ms to wait after each retry step before proceeding (default: 15000)
- * @param {number} options.ciphertextRetry.maxPdoRetries - Maximum number of PDO (Peer Data Operation) recovery requests to send before giving up (default: 5)
  * 
  * @fires Client#qr
  * @fires Client#authenticated
@@ -837,9 +832,9 @@ class Client extends EventEmitter {
             this.emit(Events.MESSAGE_CIPHERTEXT, new Message(this, msg));
         });
 
-        await exposeFunctionIfAbsent(this.pupPage, 'onCiphertextRetryFailedEvent', msg => {
+        await exposeFunctionIfAbsent(this.pupPage, 'onCiphertextFailedEvent', msg => {
             /**
-                 * Emitted when a ciphertext message failed to decrypt after retry
+                 * Emitted when a ciphertext message failed to decrypt after recovery attempt
                  * @event Client#message_ciphertext_failed
                  * @param {Message} message
                  */
@@ -857,7 +852,7 @@ class Client extends EventEmitter {
             }
         });
 
-        await this.pupPage.evaluate((ciphertextRetryOptions) => {
+        await this.pupPage.evaluate(() => {
             // Guard against undefined Store properties - some may not be available in all WhatsApp versions
             // See: https://github.com/pedroslopez/whatsapp-web.js/issues/5717
             if (!window.Store || !window.WWebJS) {
@@ -865,17 +860,13 @@ class Client extends EventEmitter {
                 return;
             }
 
-            // Ciphertext retry tracking
-            const _pendingCiphertexts = new Map();
-
-            window._clearAllCiphertextTimers = () => {
-                for (const [, entry] of _pendingCiphertexts) {
-                    if (entry.initialTimer) clearTimeout(entry.initialTimer);
-                    if (entry.retryTimer) clearTimeout(entry.retryTimer);
-                    if (entry.pdoTimer) clearTimeout(entry.pdoTimer);
-                }
-                _pendingCiphertexts.clear();
-            };
+            // Enable placeholder message resend (recovery for ciphertext messages)
+            try {
+                const gatingUtils = window.require('WAWebSyncGatingUtils');
+                gatingUtils.isPlaceholderMessageResendEnabled = () => true;
+            } catch (_) {
+                // Module may not be available in all versions
+            }
 
             // Message event listeners
             if (window.Store.Msg) {
@@ -888,101 +879,26 @@ class Client extends EventEmitter {
                 window.Store.Msg.on('add', (msg) => {
                     if (msg.isNewMsg) {
                         if(msg.type === 'ciphertext') {
-                            const msgKey = msg.id._serialized;
-
                             // defer message event until ciphertext is resolved (type changed)
-                            const onDecrypted = (_msg) => {
-                                const pending = _pendingCiphertexts.get(msgKey);
-                                if (pending) {
-                                    if (pending.initialTimer) clearTimeout(pending.initialTimer);
-                                    if (pending.retryTimer) clearTimeout(pending.retryTimer);
-                                    if (pending.pdoTimer) clearTimeout(pending.pdoTimer);
-                                    _pendingCiphertexts.delete(msgKey);
+                            const resendTimer = setTimeout(() => {
+                                try {
+                                    const { sendPeerDataOperationRequest } = window.require('WAWebSendNonMessageDataRequest');
+                                    sendPeerDataOperationRequest(4, {
+                                        msgKeys: [msg.id]
+                                    }).catch(() => {});
+                                } catch (_) {
+                                    // module may not be available
                                 }
+                            }, 5000);
+                            const failTimer = setTimeout(() => {
+                                window.onCiphertextFailedEvent(window.WWebJS.getMessageModel(msg));
+                            }, 15000);
+                            msg.once('change:type', (_msg) => {
+                                clearTimeout(resendTimer);
+                                clearTimeout(failTimer);
                                 window.onAddMessageEvent(window.WWebJS.getMessageModel(_msg));
-                            };
-
-                            msg.once('change:type', onDecrypted);
+                            });
                             window.onAddMessageCiphertextEvent(window.WWebJS.getMessageModel(msg));
-
-                            if (ciphertextRetryOptions && ciphertextRetryOptions.enabled) {
-                                const initialTimeoutMs = ciphertextRetryOptions.initialTimeoutMs || 10000;
-                                const retryTimeoutMs = ciphertextRetryOptions.retryTimeoutMs || 15000;
-                                const maxPdoRetries = ciphertextRetryOptions.maxPdoRetries || 5;
-
-                                const initialTimer = setTimeout(async () => {
-                                    if (msg.type !== 'ciphertext') {
-                                        _pendingCiphertexts.delete(msgKey);
-                                        return;
-                                    }
-
-                                    const senderJid = msg.author || msg.from;
-
-                                    try {
-                                        // Try to recreate Signal session for this sender
-                                        if (window.Store && window.Store.Signal && window.Store.Signal.deleteRemoteSession) {
-                                            const senderWid = window.Store.Signal.parseJid?.(senderJid) || senderJid;
-                                            await window.Store.Signal.deleteRemoteSession(senderWid);
-                                            if (window.Store.Signal.createSignalSession) {
-                                                await window.Store.Signal.createSignalSession(senderWid);
-                                            }
-                                        }
-                                    } catch (_) { /* empty */ }
-
-                                    let pdoAttempt = 0;
-                                    const attemptPdo = async () => {
-                                        if (msg.type !== 'ciphertext') {
-                                            _pendingCiphertexts.delete(msgKey);
-                                            return;
-                                        }
-
-                                        pdoAttempt++;
-
-                                        try {
-                                            // Send PDO type 4 request to recover the message
-                                            if (window.Store && window.Store.HistorySync && window.Store.HistorySync.sendPeerDataOperationRequest) {
-                                                await window.Store.HistorySync.sendPeerDataOperationRequest(4, {
-                                                    chatId: msg.id.remote,
-                                                    msgId: msg.id,
-                                                    senderJid: senderJid
-                                                });
-                                            }
-                                        } catch (_) { /* empty */ }
-
-                                        const pdoTimer = setTimeout(() => {
-                                            if (msg.type !== 'ciphertext') {
-                                                _pendingCiphertexts.delete(msgKey);
-                                                return;
-                                            }
-
-                                            if (pdoAttempt < maxPdoRetries) {
-                                                attemptPdo();
-                                            } else {
-                                                msg.off('change:type', onDecrypted);
-                                                _pendingCiphertexts.delete(msgKey);
-                                                window.onCiphertextRetryFailedEvent(
-                                                    window.WWebJS.getMessageModel(msg)
-                                                );
-                                            }
-                                        }, retryTimeoutMs);
-
-                                        const pending = _pendingCiphertexts.get(msgKey);
-                                        if (pending) {
-                                            if (pending.pdoTimer) clearTimeout(pending.pdoTimer);
-                                            pending.pdoTimer = pdoTimer;
-                                        }
-                                    };
-
-                                    const retryTimer = setTimeout(attemptPdo, retryTimeoutMs);
-
-                                    const pending = _pendingCiphertexts.get(msgKey);
-                                    if (pending) {
-                                        pending.retryTimer = retryTimer;
-                                    }
-                                }, initialTimeoutMs);
-
-                                _pendingCiphertexts.set(msgKey, { initialTimer: initialTimer, retryTimer: null, pdoTimer: null });
-                            }
                         } else {
                             window.onAddMessageEvent(window.WWebJS.getMessageModel(msg));
                         }
@@ -1083,7 +999,7 @@ class Client extends EventEmitter {
                     }).bind(module);
                 }
             }
-        }, this.options.ciphertextRetry);
+        });
     }    
 
     async initWebVersionCache() {
@@ -1120,17 +1036,6 @@ class Client extends EventEmitter {
      * Closes the client
      */
     async destroy() {
-        // Clear ciphertext retry timers before closing
-        if (this.pupPage && !this.pupPage.isClosed()) {
-            try {
-                await this.pupPage.evaluate(() => {
-                    if (typeof window._clearAllCiphertextTimers === 'function') {
-                        window._clearAllCiphertextTimers();
-                    }
-                });
-            } catch (_) { /* empty */ }
-        }
-
         // Allow IndexedDB and blob storage to flush pending writes before closing
         // This helps prevent session corruption, especially for Business WhatsApp accounts
         // See: https://github.com/pedroslopez/whatsapp-web.js/issues/5717

@@ -24,12 +24,6 @@ exports.DefaultOptions = {
         showNotification: true,
         intervalMs: 180000,
     },
-    ciphertextRetry: {
-        enabled: true,
-        initialTimeoutMs: 10000,
-        retryTimeoutMs: 15000,
-        maxPdoRetries: 5,
-    },
 };
 
 /**
