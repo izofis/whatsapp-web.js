@@ -162,6 +162,14 @@ declare namespace WAWebJS {
         /** Gets the current connection state for the client */
         getState(): Promise<WAState>;
 
+        /**
+         * Checks whether the client is truly connected to the WhatsApp servers.
+         * Unlike `getState()`, this also verifies the underlying WebSocket transport
+         * is open, making it reliable for detecting ghost connections caused by
+         * silent TCP drops (e.g. Docker/NAT idle timeouts).
+         */
+        checkConnection(): Promise<boolean>;
+
         /** Returns the version of WhatsApp Web currently being run */
         getWWebVersion(): Promise<string>;
 
@@ -661,6 +669,23 @@ declare namespace WAWebJS {
          * shows a user's current selected option(s) on the poll
          */
         on(event: 'vote_update', listener: (vote: PollVote) => void): this;
+
+        /**
+         * Emitted when a message fails to reach the WhatsApp server within the
+         * configured `sendMsgTimeout`. Indicates a ghost connection (silent TCP drop).
+         * Only fires when `waitUntilMsgSent: true` and `sendMsgTimeout > 0`.
+         */
+        on(
+            event: 'message_send_failed',
+            listener: (chatId: string, error: Error) => void,
+        ): this;
+
+        /**
+         * Emitted by the periodic health check when the client is no longer connected
+         * to the WhatsApp servers. Indicates a ghost connection (silent TCP drop).
+         * Only fires when `connectionHealthCheck.enabled` is `true`.
+         */
+        on(event: 'connection_lost', listener: () => void): this;
     }
 
     /** Current connection information */
@@ -760,6 +785,18 @@ declare namespace WAWebJS {
         pairWithPhoneNumber?: {
             phoneNumber: string;
             showNotification?: boolean;
+            intervalMs?: number;
+        };
+        /**
+         * Periodic connection health check configuration.
+         * When enabled, the client periodically calls `checkConnection()` and emits
+         * a `connection_lost` event when a ghost connection is detected.
+         * @default { enabled: false, intervalMs: 30000 }
+         */
+        connectionHealthCheck?: {
+            /** Whether to enable the periodic health check @default false */
+            enabled?: boolean;
+            /** Interval in milliseconds between health checks @default 30000 */
             intervalMs?: number;
         };
     }
@@ -1597,6 +1634,13 @@ declare namespace WAWebJS {
          * @default false
          */
         waitUntilMsgSent?: boolean;
+        /**
+         * Timeout in milliseconds for `waitUntilMsgSent`. Set to `0` to wait indefinitely.
+         * When the timeout is reached a `message_send_failed` event is emitted and an error is thrown.
+         * Useful for detecting ghost connections (silent TCP drops).
+         * @default 0
+         */
+        sendMsgTimeout?: number;
     }
 
     /** Options for editing a message */

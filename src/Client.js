@@ -78,6 +78,8 @@ const { exposeFunctionIfAbsent } = require('./util/Puppeteer');
  * @fires Client#group_admin_changed
  * @fires Client#group_membership_request
  * @fires Client#vote_update
+ * @fires Client#message_send_failed
+ * @fires Client#connection_lost
  */
 class Client extends EventEmitter {
     constructor(options = {}) {
@@ -104,6 +106,7 @@ class Client extends EventEmitter {
 
         this.currentIndexHtml = null;
         this.lastLoggedOut = false;
+        this._healthCheckInterval = null;
 
         Util.setFfmpegPath(this.options.ffmpegPath);
     }
@@ -374,6 +377,30 @@ class Client extends EventEmitter {
                  */
                 this.emit(Events.READY);
                 this.authStrategy.afterAuthReady();
+
+                if (this.options.connectionHealthCheck?.enabled) {
+                    const intervalMs =
+                        this.options.connectionHealthCheck.intervalMs || 30000;
+                    this._healthCheckInterval = setInterval(async () => {
+                        try {
+                            const ok = await this.checkConnection();
+                            if (!ok) {
+                                /**
+                                 * Emitted by the periodic health check when the client
+                                 * is no longer connected to the WhatsApp servers.
+                                 * This typically indicates a ghost (silently dropped)
+                                 * TCP connection. Only fires when
+                                 * `connectionHealthCheck.enabled` is `true`.
+                                 * @event Client#connection_lost
+                                 */
+                                this.emit(Events.CONNECTION_LOST);
+                            }
+                        } catch (ignoredError) {
+                            clearInterval(this._healthCheckInterval);
+                            this._healthCheckInterval = null;
+                        }
+                    }, intervalMs);
+                }
             },
         );
         let lastPercent = null;
@@ -1222,6 +1249,10 @@ class Client extends EventEmitter {
      * Closes the client
      */
     async destroy() {
+        if (this._healthCheckInterval) {
+            clearInterval(this._healthCheckInterval);
+            this._healthCheckInterval = null;
+        }
         const browser = this.pupBrowser;
         const isConnected = browser?.isConnected?.();
         if (isConnected) {
@@ -1318,6 +1349,7 @@ class Client extends EventEmitter {
      * @property {string[]} [stickerCategories=undefined] - Sets the categories of the sticker, (if sendMediaAsSticker is true). Provide emoji char array, can be null.
      * @property {boolean} [ignoreQuoteErrors = true] - Should the bot send a quoted message without the quoted message if it fails to get the quote?
      * @property {boolean} [waitUntilMsgSent = false] - Should the bot wait for the message send result?
+     * @property {number} [sendMsgTimeout = 0] - Timeout in ms for waitUntilMsgSent. 0 = wait forever. On timeout a `message_send_failed` event is emitted and an error is thrown.
      * @property {MessageMedia} [media] - Media to be sent
      * @property {any} [extra] - Extra options
      */
@@ -1415,6 +1447,7 @@ class Client extends EventEmitter {
             invokedBotWid: options.invokedBotWid,
             ignoreQuoteErrors: options.ignoreQuoteErrors !== false,
             waitUntilMsgSent: options.waitUntilMsgSent || false,
+            sendMsgTimeout: options.sendMsgTimeout || 0,
             extraOptions: options.extra,
         };
 
@@ -1477,30 +1510,46 @@ class Client extends EventEmitter {
             );
         }
 
-        const sentMsg = await this.pupPage.evaluate(
-            async (chatId, content, options, sendSeen) => {
-                const chat = await window.WWebJS.getChat(chatId, {
-                    getAsModel: false,
-                });
+        let sentMsg;
+        try {
+            sentMsg = await this.pupPage.evaluate(
+                async (chatId, content, options, sendSeen) => {
+                    const chat = await window.WWebJS.getChat(chatId, {
+                        getAsModel: false,
+                    });
 
-                if (!chat) return null;
+                    if (!chat) return null;
 
-                if (sendSeen) {
-                    await window.WWebJS.sendSeen(chatId);
-                }
+                    if (sendSeen) {
+                        await window.WWebJS.sendSeen(chatId);
+                    }
 
-                const msg = await window.WWebJS.sendMessage(
-                    chat,
-                    content,
-                    options,
-                );
-                return msg ? window.WWebJS.getMessageModel(msg) : undefined;
-            },
-            chatId,
-            content,
-            internalOptions,
-            sendSeen,
-        );
+                    const msg = await window.WWebJS.sendMessage(
+                        chat,
+                        content,
+                        options,
+                    );
+                    return msg ? window.WWebJS.getMessageModel(msg) : undefined;
+                },
+                chatId,
+                content,
+                internalOptions,
+                sendSeen,
+            );
+        } catch (err) {
+            if (err?.message?.includes('MSG_SEND_TIMEOUT')) {
+                /**
+                 * Emitted when a message fails to reach the WhatsApp server within
+                 * the configured sendMsgTimeout. This typically indicates a ghost
+                 * connection caused by a silent TCP drop (e.g. Docker/NAT timeout).
+                 * @event Client#message_send_failed
+                 * @param {string} chatId The ID of the chat the message was sent to
+                 * @param {Error} error The error that caused the failure
+                 */
+                this.emit(Events.MESSAGE_SEND_FAILED, chatId, err);
+            }
+            throw err;
+        }
 
         return sentMsg ? new Message(this, sentMsg) : undefined;
     }
@@ -1923,6 +1972,26 @@ class Client extends EventEmitter {
         return await this.pupPage.evaluate(() => {
             return window.require('WAWebSocketModel').Socket.state ?? null;
         });
+    }
+
+    /**
+     * Checks whether the client is truly connected to the WhatsApp servers.
+     * Unlike `getState()`, this also verifies the underlying WebSocket transport
+     * is still open, making it reliable for detecting ghost connections caused
+     * by silent TCP drops (e.g. Docker/NAT idle timeouts).
+     * @returns {Promise<boolean>} `true` if the connection is alive, `false` otherwise
+     */
+    async checkConnection() {
+        try {
+            return await this.pupPage.evaluate(() => {
+                const socket = window.require('WAWebSocketModel').Socket;
+                if (socket.state !== 'CONNECTED') return false;
+                const ws = socket.socket;
+                return !ws || ws.readyState === WebSocket.OPEN;
+            });
+        } catch (ignoredError) {
+            return false;
+        }
     }
 
     /**

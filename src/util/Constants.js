@@ -25,6 +25,10 @@ exports.DefaultOptions = {
         showNotification: true,
         intervalMs: 180000,
     },
+    connectionHealthCheck: {
+        enabled: false,
+        intervalMs: 30000,
+    },
 };
 
 /**
@@ -75,6 +79,8 @@ exports.Events = {
     INCOMING_CALL: 'call',
     REMOTE_SESSION_SAVED: 'remote_session_saved',
     VOTE_UPDATE: 'vote_update',
+    MESSAGE_SEND_FAILED: 'message_send_failed',
+    CONNECTION_LOST: 'connection_lost',
 };
 
 /**
