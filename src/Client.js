@@ -107,6 +107,7 @@ class Client extends EventEmitter {
         this.currentIndexHtml = null;
         this.lastLoggedOut = false;
         this._healthCheckInterval = null;
+        this._readyEmitted = false;
 
         Util.setFfmpegPath(this.options.ffmpegPath);
     }
@@ -181,6 +182,22 @@ class Client extends EventEmitter {
             state = window.require('WAWebSocketModel').Socket.state;
             return state == 'UNPAIRED' || state == 'UNPAIRED_IDLE';
         });
+
+        // Debounce: WhatsApp briefly drops to UNPAIRED during SPA navigations.
+        // Only emit LOGOUT if the session was previously ready AND state is
+        // still unpaired after a short settle period.
+        if (needAuthentication && this._readyEmitted) {
+            await new Promise((r) => setTimeout(r, 1500));
+            const stateNow = await this.pupPage.evaluate(() =>
+                window.require('WAWebSocketModel').Socket.state,
+            );
+            const isStillUnpaired =
+                stateNow === 'UNPAIRED' || stateNow === 'UNPAIRED_IDLE';
+            if (!isStillUnpaired) return; // false alarm, session recovered
+            this.emit(Events.DISCONNECTED, 'LOGOUT');
+            this._readyEmitted = false;
+            this.lastLoggedOut = false;
+        }
 
         if (needAuthentication) {
             const { failed, failureEventPayload, restart } =
@@ -299,6 +316,8 @@ class Client extends EventEmitter {
             this.pupPage,
             'onAppStateHasSyncedEvent',
             async () => {
+                if (this._readyEmitted) return;
+
                 const authEventPayload =
                     await this.authStrategy.getAuthEventPayload();
                 /**
@@ -375,6 +394,7 @@ class Client extends EventEmitter {
                  * Emitted when the client has initialized and is ready to receive messages.
                  * @event Client#ready
                  */
+                this._readyEmitted = true;
                 this.emit(Events.READY);
                 this.authStrategy.afterAuthReady();
 
@@ -520,6 +540,7 @@ class Client extends EventEmitter {
         await this.inject();
 
         this.pupPage.on('framenavigated', async (frame) => {
+            if (frame !== this.pupPage.mainFrame()) return;
             if (frame.url().includes('post_logout=1') || this.lastLoggedOut) {
                 this.emit(Events.DISCONNECTED, 'LOGOUT');
                 await this.authStrategy.logout();
@@ -877,7 +898,7 @@ class Client extends EventEmitter {
                      */
                     await this.authStrategy.disconnect();
                     this.emit(Events.DISCONNECTED, state);
-                    this.destroy();
+                    await this.destroy();
                 }
             },
         );
