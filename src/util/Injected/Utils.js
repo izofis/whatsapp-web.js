@@ -578,7 +578,29 @@ exports.LoadUtils = () => {
             .addAndSendMsgToChat(chat, message);
         await msgPromise;
 
-        if (options.waitUntilMsgSent) await sendMsgResultPromise;
+        if (options.waitUntilMsgSent) {
+            const timeoutMs =
+                typeof options.sendMsgTimeout === 'number' &&
+                options.sendMsgTimeout > 0
+                    ? options.sendMsgTimeout
+                    : 0;
+            if (timeoutMs > 0) {
+                let timeoutId;
+                const timeoutPromise = new Promise((_, reject) => {
+                    timeoutId = setTimeout(
+                        () => reject(new Error('MSG_SEND_TIMEOUT')),
+                        timeoutMs,
+                    );
+                });
+                try {
+                    await Promise.race([sendMsgResultPromise, timeoutPromise]);
+                } finally {
+                    clearTimeout(timeoutId);
+                }
+            } else {
+                await sendMsgResultPromise;
+            }
+        }
 
         return window
             .require('WAWebCollections')

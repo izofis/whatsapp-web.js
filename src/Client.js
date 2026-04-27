@@ -78,6 +78,8 @@ const { exposeFunctionIfAbsent } = require('./util/Puppeteer');
  * @fires Client#group_admin_changed
  * @fires Client#group_membership_request
  * @fires Client#vote_update
+ * @fires Client#message_send_failed
+ * @fires Client#connection_lost
  */
 class Client extends EventEmitter {
     constructor(options = {}) {
@@ -104,6 +106,8 @@ class Client extends EventEmitter {
 
         this.currentIndexHtml = null;
         this.lastLoggedOut = false;
+        this._healthCheckInterval = null;
+        this._readyEmitted = false;
 
         Util.setFfmpegPath(this.options.ffmpegPath);
     }
@@ -178,6 +182,22 @@ class Client extends EventEmitter {
             state = window.require('WAWebSocketModel').Socket.state;
             return state == 'UNPAIRED' || state == 'UNPAIRED_IDLE';
         });
+
+        // Debounce: WhatsApp briefly drops to UNPAIRED during SPA navigations.
+        // Only emit LOGOUT if the session was previously ready AND state is
+        // still unpaired after a short settle period.
+        if (needAuthentication && this._readyEmitted) {
+            await new Promise((r) => setTimeout(r, 1500));
+            const stateNow = await this.pupPage.evaluate(() =>
+                window.require('WAWebSocketModel').Socket.state,
+            );
+            const isStillUnpaired =
+                stateNow === 'UNPAIRED' || stateNow === 'UNPAIRED_IDLE';
+            if (!isStillUnpaired) return; // false alarm, session recovered
+            this.emit(Events.DISCONNECTED, 'LOGOUT');
+            this._readyEmitted = false;
+            this.lastLoggedOut = false;
+        }
 
         if (needAuthentication) {
             const { failed, failureEventPayload, restart } =
@@ -296,6 +316,8 @@ class Client extends EventEmitter {
             this.pupPage,
             'onAppStateHasSyncedEvent',
             async () => {
+                if (this._readyEmitted) return;
+
                 const authEventPayload =
                     await this.authStrategy.getAuthEventPayload();
                 /**
@@ -372,8 +394,33 @@ class Client extends EventEmitter {
                  * Emitted when the client has initialized and is ready to receive messages.
                  * @event Client#ready
                  */
+                this._readyEmitted = true;
                 this.emit(Events.READY);
                 this.authStrategy.afterAuthReady();
+
+                if (this.options.connectionHealthCheck?.enabled) {
+                    const intervalMs =
+                        this.options.connectionHealthCheck.intervalMs || 30000;
+                    this._healthCheckInterval = setInterval(async () => {
+                        try {
+                            const ok = await this.checkConnection();
+                            if (!ok) {
+                                /**
+                                 * Emitted by the periodic health check when the client
+                                 * is no longer connected to the WhatsApp servers.
+                                 * This typically indicates a ghost (silently dropped)
+                                 * TCP connection. Only fires when
+                                 * `connectionHealthCheck.enabled` is `true`.
+                                 * @event Client#connection_lost
+                                 */
+                                this.emit(Events.CONNECTION_LOST);
+                            }
+                        } catch (ignoredError) {
+                            clearInterval(this._healthCheckInterval);
+                            this._healthCheckInterval = null;
+                        }
+                    }, intervalMs);
+                }
             },
         );
         let lastPercent = null;
@@ -493,6 +540,7 @@ class Client extends EventEmitter {
         await this.inject();
 
         this.pupPage.on('framenavigated', async (frame) => {
+            if (frame !== this.pupPage.mainFrame()) return;
             if (frame.url().includes('post_logout=1') || this.lastLoggedOut) {
                 this.emit(Events.DISCONNECTED, 'LOGOUT');
                 await this.authStrategy.logout();
@@ -850,7 +898,7 @@ class Client extends EventEmitter {
                      */
                     await this.authStrategy.disconnect();
                     this.emit(Events.DISCONNECTED, state);
-                    this.destroy();
+                    await this.destroy();
                 }
             },
         );
@@ -991,22 +1039,6 @@ class Client extends EventEmitter {
 
         await exposeFunctionIfAbsent(
             this.pupPage,
-            'onCiphertextFailedEvent',
-            (msg) => {
-                /**
-                 * Emitted when a ciphertext message failed to decrypt after recovery attempt
-                 * @event Client#message_ciphertext_failed
-                 * @param {Message} message
-                 */
-                this.emit(
-                    Events.MESSAGE_CIPHERTEXT_FAILED,
-                    new Message(this, msg),
-                );
-            },
-        );
-
-        await exposeFunctionIfAbsent(
-            this.pupPage,
             'onPollVoteEvent',
             (votes) => {
                 for (const vote of votes) {
@@ -1023,10 +1055,6 @@ class Client extends EventEmitter {
         await this.pupPage.evaluate(() => {
             const { Msg, Chat } = window.require('WAWebCollections');
             const AppState = window.require('WAWebSocketModel').Socket;
-
-            // Enable placeholder message resend (recovery for ciphertext messages)
-            const gatingUtils = window.require('WAWebSyncGatingUtils');
-            gatingUtils.isPlaceholderMessageResendEnabled = () => true;
 
             Msg.on('change', (msg) => {
                 window.onChangeMessageEvent(window.WWebJS.getMessageModel(msg));
@@ -1107,25 +1135,6 @@ class Client extends EventEmitter {
                     prevState,
                 );
             });
-            const pendingResend = new Set();
-            let resendFlush = null;
-
-            function requestResend(msg) {
-                pendingResend.add(msg);
-                if (resendFlush) return;
-                resendFlush = setTimeout(() => {
-                    resendFlush = null;
-                    const msgs = [...pendingResend];
-                    pendingResend.clear();
-                    if (msgs.length === 0) return;
-                    window
-                        .require(
-                            'WAWebNonMessageDataRequestPlaceholderMessageResendUtils',
-                        )
-                        .handlePlaceholderMsgsSeen(msgs, true);
-                }, 5000);
-            }
-
             Msg.on('add', (msg) => {
                 if (!msg.isNewMsg) return;
 
@@ -1140,21 +1149,7 @@ class Client extends EventEmitter {
                     window.WWebJS.getMessageModel(msg),
                 );
 
-                if (msg.subtype && msg.subtype.endsWith('_unavailable_fanout'))
-                    return;
-
-                requestResend(msg);
-
-                const failTimer = setTimeout(() => {
-                    if (msg.type !== 'ciphertext') return;
-                    window.onCiphertextFailedEvent(
-                        window.WWebJS.getMessageModel(msg),
-                    );
-                }, 15000);
-
                 msg.once('change:type', (_msg) => {
-                    clearTimeout(failTimer);
-                    pendingResend.delete(_msg);
                     if (_msg.type === 'revoked') return;
                     window.onAddMessageEvent(
                         window.WWebJS.getMessageModel(_msg),
@@ -1275,6 +1270,10 @@ class Client extends EventEmitter {
      * Closes the client
      */
     async destroy() {
+        if (this._healthCheckInterval) {
+            clearInterval(this._healthCheckInterval);
+            this._healthCheckInterval = null;
+        }
         const browser = this.pupBrowser;
         const isConnected = browser?.isConnected?.();
         if (isConnected) {
@@ -1371,6 +1370,7 @@ class Client extends EventEmitter {
      * @property {string[]} [stickerCategories=undefined] - Sets the categories of the sticker, (if sendMediaAsSticker is true). Provide emoji char array, can be null.
      * @property {boolean} [ignoreQuoteErrors = true] - Should the bot send a quoted message without the quoted message if it fails to get the quote?
      * @property {boolean} [waitUntilMsgSent = false] - Should the bot wait for the message send result?
+     * @property {number} [sendMsgTimeout = 0] - Timeout in ms for waitUntilMsgSent. 0 = wait forever. On timeout a `message_send_failed` event is emitted and an error is thrown.
      * @property {MessageMedia} [media] - Media to be sent
      * @property {any} [extra] - Extra options
      */
@@ -1468,6 +1468,7 @@ class Client extends EventEmitter {
             invokedBotWid: options.invokedBotWid,
             ignoreQuoteErrors: options.ignoreQuoteErrors !== false,
             waitUntilMsgSent: options.waitUntilMsgSent || false,
+            sendMsgTimeout: options.sendMsgTimeout || 0,
             extraOptions: options.extra,
         };
 
@@ -1530,30 +1531,46 @@ class Client extends EventEmitter {
             );
         }
 
-        const sentMsg = await this.pupPage.evaluate(
-            async (chatId, content, options, sendSeen) => {
-                const chat = await window.WWebJS.getChat(chatId, {
-                    getAsModel: false,
-                });
+        let sentMsg;
+        try {
+            sentMsg = await this.pupPage.evaluate(
+                async (chatId, content, options, sendSeen) => {
+                    const chat = await window.WWebJS.getChat(chatId, {
+                        getAsModel: false,
+                    });
 
-                if (!chat) return null;
+                    if (!chat) return null;
 
-                if (sendSeen) {
-                    await window.WWebJS.sendSeen(chatId);
-                }
+                    if (sendSeen) {
+                        await window.WWebJS.sendSeen(chatId);
+                    }
 
-                const msg = await window.WWebJS.sendMessage(
-                    chat,
-                    content,
-                    options,
-                );
-                return msg ? window.WWebJS.getMessageModel(msg) : undefined;
-            },
-            chatId,
-            content,
-            internalOptions,
-            sendSeen,
-        );
+                    const msg = await window.WWebJS.sendMessage(
+                        chat,
+                        content,
+                        options,
+                    );
+                    return msg ? window.WWebJS.getMessageModel(msg) : undefined;
+                },
+                chatId,
+                content,
+                internalOptions,
+                sendSeen,
+            );
+        } catch (err) {
+            if (err?.message?.includes('MSG_SEND_TIMEOUT')) {
+                /**
+                 * Emitted when a message fails to reach the WhatsApp server within
+                 * the configured sendMsgTimeout. This typically indicates a ghost
+                 * connection caused by a silent TCP drop (e.g. Docker/NAT timeout).
+                 * @event Client#message_send_failed
+                 * @param {string} chatId The ID of the chat the message was sent to
+                 * @param {Error} error The error that caused the failure
+                 */
+                this.emit(Events.MESSAGE_SEND_FAILED, chatId, err);
+            }
+            throw err;
+        }
 
         return sentMsg ? new Message(this, sentMsg) : undefined;
     }
@@ -1976,6 +1993,26 @@ class Client extends EventEmitter {
         return await this.pupPage.evaluate(() => {
             return window.require('WAWebSocketModel').Socket.state ?? null;
         });
+    }
+
+    /**
+     * Checks whether the client is truly connected to the WhatsApp servers.
+     * Unlike `getState()`, this also verifies the underlying WebSocket transport
+     * is still open, making it reliable for detecting ghost connections caused
+     * by silent TCP drops (e.g. Docker/NAT idle timeouts).
+     * @returns {Promise<boolean>} `true` if the connection is alive, `false` otherwise
+     */
+    async checkConnection() {
+        try {
+            return await this.pupPage.evaluate(() => {
+                const socket = window.require('WAWebSocketModel').Socket;
+                if (socket.state !== 'CONNECTED') return false;
+                const ws = socket.socket;
+                return !ws || ws.readyState === WebSocket.OPEN;
+            });
+        } catch (ignoredError) {
+            return false;
+        }
     }
 
     /**
