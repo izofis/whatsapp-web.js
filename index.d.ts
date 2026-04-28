@@ -652,6 +652,10 @@ declare namespace WAWebJS {
          * shows a user's current selected option(s) on the poll
          */
         on(event: 'vote_update', listener: (vote: PollVote) => void): this;
+        /** Emitted when all recovery phases fail and the connection cannot be restored */
+        on(event: 'connection_lost', listener: () => void): this;
+        /** Emitted when a ghost/stuck connection is successfully recovered */
+        on(event: 'connection_recovered', listener: () => void): this;
     }
 
     /** Current connection information */
@@ -752,6 +756,26 @@ declare namespace WAWebJS {
             phoneNumber: string;
             showNotification?: boolean;
             intervalMs?: number;
+        };
+        /**
+         * Periodic connection health check with automatic recovery.
+         * Detects ghost connections (OPENING + DISCONNECTED stream) and attempts
+         * A) Socket.reconnect, B) page reload, C) browser recreate before emitting connection_lost.
+         * @default { enabled: false, intervalMs: 30000, reconnectTimeoutMs: 8000, reloadTimeoutMs: 90000, cooldownMs: 15000, recreateBrowserOnFailure: true }
+         */
+        connectionHealthCheck?: {
+            /** Whether to enable the periodic health check @default false */
+            enabled?: boolean;
+            /** Interval in milliseconds between health checks @default 30000 */
+            intervalMs?: number;
+            /** Phase A: max ms to wait after Socket.reconnect() @default 8000 */
+            reconnectTimeoutMs?: number;
+            /** Phase B: max ms to wait after page.reload() @default 90000 */
+            reloadTimeoutMs?: number;
+            /** Minimum ms between recovery attempts (cooldown) @default 15000 */
+            cooldownMs?: number;
+            /** Phase C: recreate browser process if reload also fails @default true */
+            recreateBrowserOnFailure?: boolean;
         };
     }
 
@@ -1029,6 +1053,8 @@ declare namespace WAWebJS {
         REMOTE_SESSION_SAVED = 'remote_session_saved',
         INCOMING_CALL = 'call',
         VOTE_UPDATE = 'vote_update',
+        CONNECTION_LOST = 'connection_lost',
+        CONNECTION_RECOVERED = 'connection_recovered',
     }
 
     /** Group notification types */
