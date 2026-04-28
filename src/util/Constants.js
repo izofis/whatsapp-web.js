@@ -80,6 +80,7 @@ exports.Events = {
     VOTE_UPDATE: 'vote_update',
     MESSAGE_SEND_FAILED: 'message_send_failed',
     CONNECTION_LOST: 'connection_lost',
+    CONNECTION_RECOVERED: 'connection_recovered',
 };
 
 /**

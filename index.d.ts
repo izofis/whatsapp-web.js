@@ -677,6 +677,8 @@ declare namespace WAWebJS {
          * Only fires when `connectionHealthCheck.enabled` is `true`.
          */
         on(event: 'connection_lost', listener: () => void): this;
+        /** Emitted when a ghost/stuck connection is successfully recovered via A/B/C recovery ladder */
+        on(event: 'connection_recovered', listener: () => void): this;
     }
 
     /** Current connection information */
@@ -1066,6 +1068,8 @@ declare namespace WAWebJS {
         REMOTE_SESSION_SAVED = 'remote_session_saved',
         INCOMING_CALL = 'call',
         VOTE_UPDATE = 'vote_update',
+        CONNECTION_LOST = 'connection_lost',
+        CONNECTION_RECOVERED = 'connection_recovered',
     }
 
     /** Group notification types */

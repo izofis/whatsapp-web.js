@@ -108,6 +108,8 @@ class Client extends EventEmitter {
         this.lastLoggedOut = false;
         this._healthCheckInterval = null;
         this._readyEmitted = false;
+        this._isRecoveringConnection = false;
+        this._lastRecoveryAt = 0;
 
         Util.setFfmpegPath(this.options.ffmpegPath);
     }
@@ -399,21 +401,27 @@ class Client extends EventEmitter {
                 this.authStrategy.afterAuthReady();
 
                 if (this.options.connectionHealthCheck?.enabled) {
+                    if (this._healthCheckInterval) {
+                        clearInterval(this._healthCheckInterval);
+                        this._healthCheckInterval = null;
+                    }
                     const intervalMs =
                         this.options.connectionHealthCheck.intervalMs || 30000;
                     this._healthCheckInterval = setInterval(async () => {
                         try {
                             const ok = await this.checkConnection();
                             if (!ok) {
-                                /**
-                                 * Emitted by the periodic health check when the client
-                                 * is no longer connected to the WhatsApp servers.
-                                 * This typically indicates a ghost (silently dropped)
-                                 * TCP connection. Only fires when
-                                 * `connectionHealthCheck.enabled` is `true`.
-                                 * @event Client#connection_lost
-                                 */
-                                this.emit(Events.CONNECTION_LOST);
+                                const recovered = await this._recoverConnection();
+                                if (!recovered) {
+                                    /**
+                                     * Emitted by the periodic health check when the client
+                                     * is no longer connected to the WhatsApp servers and
+                                     * all recovery phases (A/B/C) have failed.
+                                     * Only fires when `connectionHealthCheck.enabled` is `true`.
+                                     * @event Client#connection_lost
+                                     */
+                                    this.emit(Events.CONNECTION_LOST);
+                                }
                             }
                         } catch (ignoredError) {
                             clearInterval(this._healthCheckInterval);
@@ -2241,6 +2249,130 @@ class Client extends EventEmitter {
         await this.pupPage.evaluate(() => {
             window.require('WAWebSocketModel').Socket.reconnect();
         });
+    }
+
+    /**
+     * Polls checkConnection() until healthy or timeout expires.
+     * @param {number} timeoutMs - Max time to wait in ms
+     * @param {number} pollMs - Polling interval in ms
+     * @returns {Promise<boolean>}
+     */
+    async _waitForHealthyConnection(timeoutMs, pollMs = 1000) {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, pollMs));
+            try {
+                if (await this.checkConnection()) return true;
+            } catch (ignoredError) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Three-phase recovery ladder for ghost/stuck connections.
+     * Phase A: Socket.reconnect() — waits reconnectTimeoutMs
+     * Phase B: Non-blocking page reload — waits reloadTimeoutMs
+     * Phase C: Browser process recreate — waits 20 seconds
+     * Emits CONNECTION_RECOVERED if any phase succeeds.
+     * @returns {Promise<boolean>} true if connection was recovered
+     */
+    async _recoverConnection() {
+        if (this._isRecoveringConnection) return false;
+
+        const cfg = this.options.connectionHealthCheck || {};
+        const reconnectTimeoutMs = cfg.reconnectTimeoutMs || 8000;
+        const reloadTimeoutMs = cfg.reloadTimeoutMs || 90000;
+        const cooldownMs = cfg.cooldownMs || 15000;
+        const recreateBrowserOnFailure = cfg.recreateBrowserOnFailure !== false;
+
+        if (Date.now() - this._lastRecoveryAt < cooldownMs) return false;
+
+        this._isRecoveringConnection = true;
+        this._lastRecoveryAt = Date.now();
+
+        try {
+            // Phase A: Socket.reconnect
+            try { await this.resetState(); } catch (ignoredError) {}
+            if (await this._waitForHealthyConnection(reconnectTimeoutMs, 1000)) {
+                this.emit(Events.CONNECTION_RECOVERED);
+                return true;
+            }
+
+            // Phase B: Non-blocking page reload
+            try {
+                await this.pupPage.evaluate(() => { window.location.reload(); });
+            } catch (ignoredError) {}
+            if (await this._waitForHealthyConnection(reloadTimeoutMs, 2000)) {
+                this.emit(Events.CONNECTION_RECOVERED);
+                return true;
+            }
+
+            // Phase C: Recreate browser process (without destroying auth/session)
+            if (recreateBrowserOnFailure) {
+                await this._recreateBrowserProcess();
+                if (await this._waitForHealthyConnection(20000, 1000)) {
+                    this.emit(Events.CONNECTION_RECOVERED);
+                    return true;
+                }
+            }
+
+            return false;
+        } finally {
+            this._isRecoveringConnection = false;
+        }
+    }
+
+    /**
+     * Closes and recreates the browser and page without touching auth/session.
+     * Used as Phase C of the recovery ladder.
+     */
+    async _recreateBrowserProcess() {
+        if (this._healthCheckInterval) {
+            clearInterval(this._healthCheckInterval);
+            this._healthCheckInterval = null;
+        }
+
+        try {
+            if (this.pupBrowser) {
+                try { await this.pupBrowser.close(); } catch (ignoredError) {}
+                this.pupBrowser = null;
+                this.pupPage = null;
+            }
+
+            const puppeteerOpts = this.options.puppeteer || {};
+            const browserArgs = [...(puppeteerOpts.args || [])];
+            if (
+                this.options.userAgent !== false &&
+                !browserArgs.find(a => a.includes('--user-agent'))
+            ) {
+                browserArgs.push(`--user-agent=${this.options.userAgent}`);
+            }
+            browserArgs.push('--disable-blink-features=AutomationControlled');
+
+            this.pupBrowser = await puppeteer.launch({ ...puppeteerOpts, args: browserArgs });
+            this.pupPage = await this.pupBrowser.newPage();
+
+            if (this.options.userAgent) {
+                await this.pupPage.setUserAgent(this.options.userAgent);
+            }
+            if (this.options.bypassCSP) {
+                await this.pupPage.setBypassCSP(true);
+            }
+            if (this.options.proxyAuthentication) {
+                await this.pupPage.authenticate(this.options.proxyAuthentication);
+            }
+
+            await this.pupPage.goto(WhatsWebURL, {
+                waitUntil: 'load',
+                timeout: 0,
+                referer: 'https://whatsapp.com/',
+            });
+            await this.inject();
+        } catch (ignoredError) {
+            // Phase C failed silently; caller will handle
+        }
     }
 
     /**
