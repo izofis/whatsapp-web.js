@@ -333,7 +333,8 @@ declare namespace WAWebJS {
         /** Get Contact lid and phone */
         getContactLidAndPhone(
             userIds: string[],
-        ): Promise<{ lid: string; pn: string }[]>;
+            options?: { timeout?: number },
+        ): Promise<{ lid: string | null; pn: string | null }[]>;
 
         /** Changes and returns the archive state of the Chat */
         unarchiveChat(chatId: string): Promise<boolean>;

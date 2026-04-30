@@ -2012,11 +2012,27 @@ class Client extends EventEmitter {
      */
     async checkConnection() {
         try {
-            return await this.pupPage.evaluate(() => {
+            return await this.pupPage.evaluate(async () => {
                 const socket = window.require('WAWebSocketModel').Socket;
                 if (socket.state !== 'CONNECTED') return false;
                 const ws = socket.socket;
-                return !ws || ws.readyState === WebSocket.OPEN;
+                // If the WebSocket object is accessible (older WA Web), check readyState directly.
+                if (ws !== null && ws !== undefined) {
+                    return ws.readyState === WebSocket.OPEN;
+                }
+                // In newer WA Web versions the WebSocket lives in a SharedWorker and
+                // socket.socket is always null from the main thread.
+                // Fall back to a lightweight network probe with a short timeout.
+                return await Promise.race([
+                    window
+                        .require('WAWebQueryExistsJob')
+                        .queryWidExists(
+                            window.require('WAWebWidFactory').createWid('0@s.whatsapp.net'),
+                        )
+                        .then(() => true)
+                        .catch(() => false),
+                    new Promise((resolve) => setTimeout(() => resolve(false), 5000)),
+                ]);
             });
         } catch (ignoredError) {
             return false;
@@ -3473,22 +3489,38 @@ class Client extends EventEmitter {
      * @param {string[]} userIds - Array of user IDs
      * @returns {Promise<Array<{ lid: string, pn: string }>>}
      */
-    async getContactLidAndPhone(userIds) {
-        return await this.pupPage.evaluate(async (userIds) => {
-            if (!Array.isArray(userIds)) userIds = [userIds];
+    async getContactLidAndPhone(userIds, { timeout = 15000 } = {}) {
+        return await this.pupPage.evaluate(
+            async (userIds, timeout) => {
+                if (!Array.isArray(userIds)) userIds = [userIds];
 
-            return await Promise.all(
-                userIds.map(async (userId) => {
-                    const { lid, phone } =
-                        await window.WWebJS.enforceLidAndPnRetrieval(userId);
+                return await Promise.all(
+                    userIds.map(async (userId) => {
+                        const result = await Promise.race([
+                            window.WWebJS.enforceLidAndPnRetrieval(userId),
+                            new Promise((_, reject) =>
+                                setTimeout(
+                                    () =>
+                                        reject(
+                                            new Error(
+                                                `enforceLidAndPnRetrieval timed out for ${userId}`,
+                                            ),
+                                        ),
+                                    timeout,
+                                ),
+                            ),
+                        ]);
 
-                    return {
-                        lid: lid?._serialized,
-                        pn: phone?._serialized,
-                    };
-                }),
-            );
-        }, userIds);
+                        return {
+                            lid: result?.lid?._serialized ?? null,
+                            pn: result?.phone?._serialized ?? null,
+                        };
+                    }),
+                );
+            },
+            userIds,
+            timeout,
+        );
     }
 
     /**
