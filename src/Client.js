@@ -1576,6 +1576,19 @@ class Client extends EventEmitter {
                  * @param {Error} error The error that caused the failure
                  */
                 this.emit(Events.MESSAGE_SEND_FAILED, chatId, err);
+            } else if (
+                err?.message?.includes('window.WWebJS') ||
+                (err?.message?.includes('Cannot read properties of undefined') &&
+                    err?.message?.includes('getChat'))
+            ) {
+                /**
+                 * window.WWebJS is undefined — the browser context was reset
+                 * (e.g. after Phase C recovery) but injection has not yet completed.
+                 * Emit connection_lost and trigger the recovery ladder so the client
+                 * heals itself without requiring a manual restart.
+                 */
+                this.emit(Events.CONNECTION_LOST);
+                this._recoverConnection().catch(() => {});
             }
             throw err;
         }
