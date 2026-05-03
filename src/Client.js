@@ -2291,7 +2291,18 @@ class Client extends EventEmitter {
         while (Date.now() < deadline) {
             await new Promise(r => setTimeout(r, pollMs));
             try {
-                if (await this.checkConnection()) return true;
+                if (await this.checkConnection()) {
+                    // WebSocket is open — also verify window.WWebJS is injected and
+                    // functional. Phase C (browser recreate) leaves the socket connected
+                    // but never runs ExposeStore, so WWebJS would be undefined even
+                    // though checkConnection() returns true. Only emit CONNECTION_RECOVERED
+                    // when the page context is truly ready for API calls.
+                    const wwebjsReady = await this.pupPage.evaluate(
+                        () => typeof window.WWebJS !== 'undefined' &&
+                              typeof window.WWebJS.getChat === 'function'
+                    ).catch(() => false);
+                    if (wwebjsReady) return true;
+                }
             } catch (ignoredError) {
                 return false;
             }
