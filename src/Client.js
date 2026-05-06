@@ -3518,6 +3518,15 @@ class Client extends EventEmitter {
             async (userIds, timeout) => {
                 if (!Array.isArray(userIds)) userIds = [userIds];
 
+                if (
+                    typeof window.WWebJS === 'undefined' ||
+                    typeof window.WWebJS.enforceLidAndPnRetrieval !== 'function'
+                ) {
+                    throw new Error(
+                        'WWebJS_NOT_READY: enforceLidAndPnRetrieval is unavailable',
+                    );
+                }
+
                 return await Promise.all(
                     userIds.map(async (userId) => {
                         const result = await Promise.race([
